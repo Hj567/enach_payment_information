@@ -28,8 +28,8 @@ This app fetches Razorpay payments, finds the latest token per customer, and bui
 # Inputs (no button – everything is automatic)
 # ----------------------------------------------------------
 
-key_id = "rzp_live_RmhBQY0fhwdaM5"
-key_secret = "1xlKDlEeoLolPGAekPuxcEJZ"
+key_id = st.secrets["RAZORPAY_KEY_ID"]
+key_secret = st.secrets["RAZORPAY_KEY_SECRET"]
 
 
 exclude_names_str = st.text_input(
