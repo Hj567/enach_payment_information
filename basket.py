@@ -27,7 +27,7 @@ This app:
   - Actual Razorpay `status` values on payment dates  
 
 **Tab 2 – Notion**
-- Fetches all rows from your Notion EMI database
+- Fetches all rows from your EMI database
 - Shows them as a table
 - Lists any attached PDFs as download/view links
 """
@@ -354,7 +354,7 @@ def fetch_notion_db():
 # ----------------------------------------------------------
 # Tabs layout
 # ----------------------------------------------------------
-tab1, tab2 = st.tabs(["Razorpay Status Table", "Notion EMI Database"])
+tab1, tab2 = st.tabs(["Razorpay Status Table", "EMI Database"])
 
 # ----------------------------------------------------------
 # Tab 1: Razorpay token status table
@@ -383,7 +383,7 @@ with tab1:
 # Tab 2: Notion database browser (PDFs in separate columns)
 # ----------------------------------------------------------
 with tab2:
-    st.subheader("Notion EMI Database")
+    st.subheader("EMI Database")
 
     with st.spinner("Fetching data from Notion..."):
         notion_df, notion_files = fetch_notion_db()
