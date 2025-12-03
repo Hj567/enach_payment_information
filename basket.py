@@ -215,8 +215,6 @@ def color_status(val):
 # ----------------------------------------------------------
 # Notion config
 # ----------------------------------------------------------
-NOTION_TOKEN = "ntn_m753053303634rFIHwUa6VYWOqSLtZm7lNXVpUCVNoi53P"
-NOTION_DB_ID = "2041c0dad0ac80ff874af469a7cf2d44"
 
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
