@@ -1,6 +1,6 @@
 import requests
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, date
 from requests.auth import HTTPBasicAuth
 import streamlit as st
 
@@ -25,6 +25,7 @@ This app:
   - `"No Token"` before the token starts  
   - `"Missing"` where there is no payment after token start  
   - Actual Razorpay `status` values on payment dates  
+  - ✅ `"Ended"` after the Notion **End Date** has passed (for dates after End Date)
 
 **Tab 2 – Notion**
 - Fetches all rows from your EMI database
@@ -34,7 +35,7 @@ This app:
 )
 
 # ----------------------------------------------------------
-# Razorpay config
+# Razorpay + Notion secrets
 # ----------------------------------------------------------
 key_id = st.secrets["RAZORPAY_KEY_ID"]
 key_secret = st.secrets["RAZORPAY_KEY_SECRET"]
@@ -48,7 +49,6 @@ exclude_names_str = st.text_input(
     help="These customer names will be removed from the final table in the Razorpay tab.",
 )
 
-# Parse excluded names
 exclude_names = [n.strip() for n in exclude_names_str.split(",") if n.strip()]
 
 if not key_id or not key_secret:
@@ -59,7 +59,9 @@ BASE_URL = "https://api.razorpay.com/v1"
 auth = HTTPBasicAuth(key_id, key_secret)
 _customer_cache = {}
 
-
+# ----------------------------------------------------------
+# Razorpay helpers
+# ----------------------------------------------------------
 def get_customer_name(customer_id):
     """Fetch customer name from Razorpay (with a simple in-memory cache)."""
     if not customer_id:
@@ -122,100 +124,9 @@ def fetch_all_payments():
     return pd.DataFrame(rows)
 
 
-def build_status_table(df, exclude_names_list):
-    """
-    From a raw payments DataFrame, build the Name × Date status table using only
-    the latest token per user and marking pre-token dates as 'No Token'.
-    """
-    # We only care about rows with a token and a date
-    df = df.dropna(subset=["date", "token_id"])
-
-    # Remove unwanted names
-    if exclude_names_list:
-        df = df[~df["name"].isin(exclude_names_list)]
-
-    if df.empty:
-        return None
-
-    # Date-only
-    df["date"] = df["date"].dt.normalize()
-
-    # 1) token_start_date = earliest payment date for each token
-    token_start = df.groupby("token_id")["date"].min()
-    df["token_start_date"] = df["token_id"].map(token_start)
-
-    # 2) For each user, keep only their latest token (by token_start_date)
-    token_summary = (
-        df[["name", "customer_id", "token_id", "token_start_date"]]
-        .drop_duplicates()
-        .sort_values(["name", "token_start_date", "token_id"])
-    )
-
-    latest_token_per_user = (
-        token_summary.groupby("name")
-        .tail(1)  # last = latest token for that user
-        .reset_index(drop=True)
-    )
-
-    # Map name -> latest token_id
-    name_to_latest_token = latest_token_per_user.set_index("name")["token_id"].to_dict()
-    df["latest_token_id_for_user"] = df["name"].map(name_to_latest_token)
-
-    # Keep only payments done with the latest token
-    df_latest = df[df["token_id"] == df["latest_token_id_for_user"]].copy()
-    if df_latest.empty:
-        return None
-
-    # 3) Build continuous date range and pivot
-    full_range = pd.date_range(df_latest["date"].min(), df_latest["date"].max(), freq="D")
-
-    status_table = df_latest.pivot_table(
-        index="name",
-        columns="date",
-        values="status",
-        aggfunc=lambda x: ", ".join(sorted(set(x))),
-    )
-
-    # Ensure all dates included as columns
-    status_table = status_table.reindex(columns=full_range)
-
-    # 4) Mark dates before each user's token_start_date as "No Token"
-    PRE_TOKEN_LABEL = "No Token"
-    name_to_start = latest_token_per_user.set_index("name")["token_start_date"].to_dict()
-
-    for name in status_table.index:
-        start_date = name_to_start.get(name)
-        if start_date is None:
-            continue
-        mask_pre = status_table.columns < start_date
-        status_table.loc[name, mask_pre] = PRE_TOKEN_LABEL
-
-    # 5) Remaining NaNs (after token start but no payment) → "Missing"
-    status_table = status_table.fillna("Missing")
-
-    # Pretty date headers
-    status_table.columns = [d.strftime("%d-%b-%Y") for d in status_table.columns]
-
-    return status_table
-
-
 # ----------------------------------------------------------
-# Coloring function for Streamlit table (Razorpay tab)
+# Notion config + helpers
 # ----------------------------------------------------------
-def color_status(val):
-    """Highlight Missing (yellow) and Failed (red)."""
-    if isinstance(val, str):
-        if val == "Missing":
-            return "background-color: yellow; color: black; font-weight: 600;"
-        if val.lower() == "failed":
-            return "background-color: red; color: white; font-weight: 600;"
-    return ""
-
-
-# ----------------------------------------------------------
-# Notion config
-# ----------------------------------------------------------
-
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
     "Content-Type": "application/json",
@@ -227,7 +138,7 @@ def fetch_notion_db():
     """
     Fetch all rows from a Notion database and flatten properties into a DataFrame.
     Also returns a list of attached files (with URLs) for download links.
-    NOW supports 'formula' properties as well.
+    Supports 'formula' properties as well.
     """
     url = f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query"
     payload = {"page_size": 100}
@@ -321,7 +232,7 @@ def fetch_notion_db():
                 if file_names:
                     row[prop_name] = ", ".join(file_names)
 
-            # 🔹 Formula (new part)
+            # Formula
             elif ptype == "formula":
                 formula_val = prop_val.get("formula") or {}
                 ftype = formula_val.get("type")
@@ -336,11 +247,10 @@ def fetch_notion_db():
                     d = formula_val.get("date")
                     row[prop_name] = d.get("start") if d else None
                 else:
-                    # Unknown formula subtype – store None (or raw dict if you prefer)
                     row[prop_name] = None
 
-            # Fallback: ignore other types (relation, rollup, people, etc.)
             else:
+                # Ignore other Notion types (relation, rollup, people, etc.)
                 pass
 
         row["page_id"] = page.get("id")
@@ -349,6 +259,149 @@ def fetch_notion_db():
     df = pd.DataFrame(rows)
     return df, files
 
+
+def parse_notion_date_to_datetime(x):
+    """Notion date strings can be 'YYYY-MM-DD' or ISO; returns pandas Timestamp or NaT."""
+    return pd.to_datetime(x, errors="coerce")
+
+
+def build_end_date_map(notion_df):
+    """
+    Build mapping: Name -> End Date (as pandas Timestamp normalized).
+    Expects Notion columns: 'Signed By Name' and 'End Date'
+    """
+    if notion_df is None or notion_df.empty:
+        return {}
+
+    if "Signed By Name" not in notion_df.columns or "End Date" not in notion_df.columns:
+        return {}
+
+    tmp = notion_df[["Signed By Name", "End Date"]].copy()
+    tmp["End Date"] = tmp["End Date"].apply(parse_notion_date_to_datetime).dt.normalize()
+
+    # If duplicates exist, keep the latest End Date
+    tmp = tmp.dropna(subset=["Signed By Name"])
+    tmp = tmp.sort_values("End Date").drop_duplicates(subset=["Signed By Name"], keep="last")
+
+    return tmp.set_index("Signed By Name")["End Date"].to_dict()
+
+
+# ----------------------------------------------------------
+# Build Razorpay Name × Date status table (latest token only)
+# + Ended after Notion End Date
+# + Missing Count + Failed Count at end of each row
+# ----------------------------------------------------------
+def build_status_table(df, exclude_names_list, name_to_end_date=None):
+    """
+    From a raw payments DataFrame, build the Name × Date status table using only
+    the latest token per user and marking pre-token dates as 'No Token'.
+
+    NEW:
+    - After Notion End Date has passed, mark dates after end date as 'Ended'
+    - Add Missing Count and Failed Count columns at end
+    """
+    name_to_end_date = name_to_end_date or {}
+
+    # Only rows with date + token
+    df = df.dropna(subset=["date", "token_id"])
+
+    # Remove unwanted names
+    if exclude_names_list:
+        df = df[~df["name"].isin(exclude_names_list)]
+
+    if df.empty:
+        return None
+
+    df["date"] = df["date"].dt.normalize()
+
+    # 1) token_start_date = earliest payment date per token
+    token_start = df.groupby("token_id")["date"].min()
+    df["token_start_date"] = df["token_id"].map(token_start)
+
+    # 2) latest token per user (by token_start_date)
+    token_summary = (
+        df[["name", "customer_id", "token_id", "token_start_date"]]
+        .drop_duplicates()
+        .sort_values(["name", "token_start_date", "token_id"])
+    )
+
+    latest_token_per_user = (
+        token_summary.groupby("name").tail(1).reset_index(drop=True)
+    )
+
+    name_to_latest_token = latest_token_per_user.set_index("name")["token_id"].to_dict()
+    df["latest_token_id_for_user"] = df["name"].map(name_to_latest_token)
+
+    df_latest = df[df["token_id"] == df["latest_token_id_for_user"]].copy()
+    if df_latest.empty:
+        return None
+
+    # 3) date range + pivot
+    full_range = pd.date_range(df_latest["date"].min(), df_latest["date"].max(), freq="D")
+
+    status_table = df_latest.pivot_table(
+        index="name",
+        columns="date",
+        values="status",
+        aggfunc=lambda x: ", ".join(sorted(set(x))),
+    )
+
+    status_table = status_table.reindex(columns=full_range)
+
+    # 4) Pre-token dates -> No Token
+    PRE_TOKEN_LABEL = "No Token"
+    name_to_start = latest_token_per_user.set_index("name")["token_start_date"].to_dict()
+
+    for name in status_table.index:
+        start_date = name_to_start.get(name)
+        if start_date is None:
+            continue
+        status_table.loc[name, status_table.columns < start_date] = PRE_TOKEN_LABEL
+
+    # 5) Remaining NaN after token start -> Missing
+    status_table = status_table.fillna("Missing")
+
+    # 6) After End Date (if today > end date) -> Ended
+    ENDED_LABEL = "Ended"
+    today = pd.Timestamp(date.today())
+
+    for name in status_table.index:
+        end_date = name_to_end_date.get(name)
+        if end_date is None or pd.isna(end_date):
+            continue
+        if today > end_date:
+            status_table.loc[name, status_table.columns > end_date] = ENDED_LABEL
+
+    # 7) Add row totals
+    def is_failed_cell(x):
+        if not isinstance(x, str):
+            return False
+        return "failed" in x.lower()
+
+    status_table["Missing Count"] = (status_table == "Missing").sum(axis=1)
+    status_table["Failed Count"] = status_table.applymap(is_failed_cell).sum(axis=1)
+
+    # 8) Pretty date headers (only for the date columns)
+    date_cols = [c for c in status_table.columns if isinstance(c, pd.Timestamp)]
+    pretty = {d: d.strftime("%d-%b-%Y") for d in date_cols}
+    status_table = status_table.rename(columns=pretty)
+
+    return status_table
+
+
+# ----------------------------------------------------------
+# Coloring function for Streamlit table (Razorpay tab)
+# ----------------------------------------------------------
+def color_status(val):
+    """Highlight Missing (yellow), Failed (red), Ended (grey)."""
+    if isinstance(val, str):
+        if val == "Missing":
+            return "background-color: yellow; color: black; font-weight: 600;"
+        if val.lower() == "failed":
+            return "background-color: red; color: white; font-weight: 600;"
+        if val == "Ended":
+            return "background-color: #e5e7eb; color: #111827; font-weight: 600;"
+    return ""
 
 
 # ----------------------------------------------------------
@@ -360,13 +413,22 @@ tab1, tab2 = st.tabs(["Razorpay Status Table", "EMI Database"])
 # Tab 1: Razorpay token status table
 # ----------------------------------------------------------
 with tab1:
-    with st.spinner("Fetching payments and building status table from Razorpay..."):
+    with st.spinner("Fetching payments from Razorpay..."):
         df_raw = fetch_all_payments()
 
     if df_raw.empty:
         st.warning("No payments found from Razorpay with the given credentials.")
     else:
-        status_table = build_status_table(df_raw, exclude_names)
+        # Fetch Notion here ONLY to get End Date mapping for the 'Ended' logic
+        with st.spinner("Fetching End Dates from Notion..."):
+            notion_df_for_end, _ = fetch_notion_db()
+            name_to_end_date = build_end_date_map(notion_df_for_end)
+
+        status_table = build_status_table(
+            df_raw,
+            exclude_names,
+            name_to_end_date=name_to_end_date,
+        )
 
         st.subheader("Name × Date – Token Status Table")
 
@@ -376,9 +438,6 @@ with tab1:
             styled_table = status_table.style.applymap(color_status)
             st.dataframe(styled_table, use_container_width=True)
 
-# ----------------------------------------------------------
-# Tab 2: Notion database browser (PDFs in separate columns)
-# ----------------------------------------------------------
 # ----------------------------------------------------------
 # Tab 2: Notion database browser (PDFs in separate columns)
 # ----------------------------------------------------------
@@ -441,7 +500,6 @@ with tab2:
             "KFS PDF",
         ]
 
-        # Keep only those that exist, then append the rest
         ordered_cols = [c for c in preferred_order if c in notion_df.columns] + [
             c for c in notion_df.columns if c not in preferred_order
         ]
@@ -463,4 +521,3 @@ with tab2:
         """
 
         st.markdown(scrollable_html, unsafe_allow_html=True)
-
