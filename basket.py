@@ -16,18 +16,17 @@ st.markdown(
     """
 # Razorpay Payments – Token Status Table
 
-This app:
-
 **Tab 1 – Razorpay**
 - Fetches Razorpay payments
 - Finds the latest token per customer
 - Builds a **Name × Date** table showing:
-  - `"No Token"` before the token starts  
-  - `"Missing"` where there is no payment after token start  
-  - Actual Razorpay `status` values on payment dates
+  - `"No Token"` before token starts
+  - `"Missing"` where no payment exists after token start
+  - Razorpay `status` values on payment dates
   - ✅ `"Ended"` after Notion **End Date** has passed (based on **Customer_ID**)
 
-- ✅ Adds **Missing Count** and **Failed Count** at the end of each row
+- ✅ Adds **Missing Count**, **Failed Count**, and **Due Amount (₹)** at end of each row  
+  **Due Amount (₹)** = (Missing + Failed) × EMI Amount (from Notion)
 
 **Tab 2 – Notion**
 - Fetches all rows from your EMI database
@@ -240,7 +239,6 @@ def fetch_notion_db():
                     row[prop_name] = d.get("start") if d else None
                 else:
                     row[prop_name] = None
-
             else:
                 pass
 
@@ -263,27 +261,54 @@ def build_customer_end_date_map(notion_df):
         return {}
 
     tmp = notion_df[["Customer_ID", "End Date"]].copy()
-
     tmp["Customer_ID"] = tmp["Customer_ID"].astype(str).str.strip()
     tmp["End Date"] = pd.to_datetime(tmp["End Date"], errors="coerce").dt.normalize()
+    tmp = tmp[tmp["Customer_ID"].notna() & (tmp["Customer_ID"] != "")]
+    return tmp.groupby("Customer_ID")["End Date"].max().to_dict()
+
+
+def build_customer_emi_amount_map(notion_df):
+    """
+    Customer_ID -> EMI Amount
+    If multiple rows exist for same Customer_ID, pick the latest non-null EMI Amount.
+    """
+    if notion_df is None or notion_df.empty:
+        return {}
+
+    if "Customer_ID" not in notion_df.columns or "EMI Amount" not in notion_df.columns:
+        return {}
+
+    tmp = notion_df[["Customer_ID", "EMI Amount"]].copy()
+    tmp["Customer_ID"] = tmp["Customer_ID"].astype(str).str.strip()
+
+    # Make EMI numeric
+    tmp["EMI Amount"] = pd.to_numeric(tmp["EMI Amount"], errors="coerce")
 
     tmp = tmp[tmp["Customer_ID"].notna() & (tmp["Customer_ID"] != "")]
+    tmp = tmp.dropna(subset=["EMI Amount"])
 
-    # If multiple records exist for the same customer, use the latest end date
-    return tmp.groupby("Customer_ID")["End Date"].max().to_dict()
+    if tmp.empty:
+        return {}
+
+    # If multiple entries, keep the last non-null EMI after sorting by index (or just take max)
+    # Here we take max EMI (safer if EMI changed upward; adjust if you prefer "last edited" logic)
+    return tmp.groupby("Customer_ID")["EMI Amount"].max().to_dict()
 
 
 # ----------------------------------------------------------
 # Build Razorpay status table
 # ----------------------------------------------------------
-def build_status_table(df, exclude_names_list, customer_to_end_date=None):
+def build_status_table(df, exclude_names_list, customer_to_end_date=None, customer_to_emi=None):
     """
     Build Name × Date table for the latest token per user.
+
     NEW:
     - After Notion End Date has passed, dates after end date -> 'Ended' (based on customer_id)
-    - Add Missing Count + Failed Count at end of each row
+    - Add Missing Count + Failed Count + Due Amount (₹)
+      Due Amount = (Missing + Failed) * EMI Amount
     """
     customer_to_end_date = customer_to_end_date or {}
+    customer_to_emi = customer_to_emi or {}
 
     df = df.dropna(subset=["date", "token_id"])
 
@@ -339,6 +364,7 @@ def build_status_table(df, exclude_names_list, customer_to_end_date=None):
     ENDED_LABEL = "Ended"
     today = pd.Timestamp(date.today())
 
+    # (name -> customer_id) for the latest-token dataset
     name_to_customer = df_latest.groupby("name")["customer_id"].first().to_dict()
 
     for name in status_table.index:
@@ -361,6 +387,27 @@ def build_status_table(df, exclude_names_list, customer_to_end_date=None):
 
     status_table["Missing Count"] = (status_table == "Missing").sum(axis=1)
     status_table["Failed Count"] = status_table.applymap(is_failed_cell).sum(axis=1)
+
+    # ✅ EMI + Due Amount
+    emi_vals = []
+    due_vals = []
+
+    for name in status_table.index:
+        cust_id = name_to_customer.get(name)
+        emi = customer_to_emi.get(cust_id) if cust_id else None
+
+        missing = status_table.loc[name, "Missing Count"]
+        failed = status_table.loc[name, "Failed Count"]
+
+        if emi is None or pd.isna(emi):
+            emi_vals.append(None)
+            due_vals.append(None)
+        else:
+            emi_vals.append(float(emi))
+            due_vals.append(float(emi) * float(missing + failed))
+
+    status_table["EMI Amount (Notion)"] = emi_vals
+    status_table["Due Amount (₹)"] = due_vals
 
     # Pretty date headers only for date columns
     date_cols = [c for c in status_table.columns if isinstance(c, pd.Timestamp)]
@@ -400,14 +447,16 @@ with tab1:
     if df_raw.empty:
         st.warning("No payments found from Razorpay with the given credentials.")
     else:
-        with st.spinner("Fetching End Dates from Notion..."):
-            notion_df_for_end, _ = fetch_notion_db()
-            customer_to_end_date = build_customer_end_date_map(notion_df_for_end)
+        with st.spinner("Fetching End Dates + EMI Amounts from Notion..."):
+            notion_df_for_maps, _ = fetch_notion_db()
+            customer_to_end_date = build_customer_end_date_map(notion_df_for_maps)
+            customer_to_emi = build_customer_emi_amount_map(notion_df_for_maps)
 
         status_table = build_status_table(
             df_raw,
             exclude_names,
             customer_to_end_date=customer_to_end_date,
+            customer_to_emi=customer_to_emi,
         )
 
         st.subheader("Name × Date – Token Status Table")
@@ -465,10 +514,10 @@ with tab2:
             "Signed By Name",
             "Customer_ID",
             "id",
-            "Processing Fees (%)",
             "EMI Amount",
             "Disbursement Amount",
             "End Date",
+            "Processing Fees (%)",
             "Loan Agreement PDF",
             "KFS PDF",
         ]
