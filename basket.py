@@ -24,8 +24,10 @@ This app:
 - Builds a **Name × Date** table showing:
   - `"No Token"` before the token starts  
   - `"Missing"` where there is no payment after token start  
-  - Actual Razorpay `status` values on payment dates  
-  - ✅ `"Ended"` after the Notion **End Date** has passed (for dates after End Date)
+  - Actual Razorpay `status` values on payment dates
+  - ✅ `"Ended"` after Notion **End Date** has passed (based on **Customer_ID**)
+
+- ✅ Adds **Missing Count** and **Failed Count** at the end of each row
 
 **Tab 2 – Notion**
 - Fetches all rows from your EMI database
@@ -35,7 +37,7 @@ This app:
 )
 
 # ----------------------------------------------------------
-# Razorpay + Notion secrets
+# Razorpay config
 # ----------------------------------------------------------
 key_id = st.secrets["RAZORPAY_KEY_ID"]
 key_secret = st.secrets["RAZORPAY_KEY_SECRET"]
@@ -125,7 +127,7 @@ def fetch_all_payments():
 
 
 # ----------------------------------------------------------
-# Notion config + helpers
+# Notion config
 # ----------------------------------------------------------
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -167,40 +169,32 @@ def fetch_notion_db():
         for prop_name, prop_val in props.items():
             ptype = prop_val.get("type")
 
-            # Title
             if ptype == "title":
                 txt = "".join([t.get("plain_text", "") for t in prop_val.get("title", [])])
                 row[prop_name] = txt
 
-            # Rich text
             elif ptype == "rich_text":
                 txt = "".join([t.get("plain_text", "") for t in prop_val.get("rich_text", [])])
                 row[prop_name] = txt
 
-            # Number
             elif ptype == "number":
                 row[prop_name] = prop_val.get("number")
 
-            # Select
             elif ptype == "select":
                 sel = prop_val.get("select")
                 row[prop_name] = sel.get("name") if sel else None
 
-            # Multi-select
             elif ptype == "multi_select":
                 ms = prop_val.get("multi_select", [])
                 row[prop_name] = ", ".join([o.get("name", "") for o in ms])
 
-            # Date
             elif ptype == "date":
                 d = prop_val.get("date")
                 row[prop_name] = d.get("start") if d else None
 
-            # Checkbox
             elif ptype == "checkbox":
                 row[prop_name] = prop_val.get("checkbox")
 
-            # URL / Email / Phone
             elif ptype == "url":
                 row[prop_name] = prop_val.get("url")
             elif ptype == "email":
@@ -208,7 +202,6 @@ def fetch_notion_db():
             elif ptype == "phone_number":
                 row[prop_name] = prop_val.get("phone_number")
 
-            # Files (attachments)
             elif ptype == "files":
                 f_list = prop_val.get("files", [])
                 file_names = []
@@ -232,7 +225,6 @@ def fetch_notion_db():
                 if file_names:
                     row[prop_name] = ", ".join(file_names)
 
-            # Formula
             elif ptype == "formula":
                 formula_val = prop_val.get("formula") or {}
                 ftype = formula_val.get("type")
@@ -250,7 +242,6 @@ def fetch_notion_db():
                     row[prop_name] = None
 
             else:
-                # Ignore other Notion types (relation, rollup, people, etc.)
                 pass
 
         row["page_id"] = page.get("id")
@@ -260,52 +251,42 @@ def fetch_notion_db():
     return df, files
 
 
-def parse_notion_date_to_datetime(x):
-    """Notion date strings can be 'YYYY-MM-DD' or ISO; returns pandas Timestamp or NaT."""
-    return pd.to_datetime(x, errors="coerce")
-
-
-def build_end_date_map(notion_df):
+def build_customer_end_date_map(notion_df):
     """
-    Build mapping: Name -> End Date (as pandas Timestamp normalized).
-    Expects Notion columns: 'Signed By Name' and 'End Date'
+    Customer_ID -> latest End Date (max)
+    Uses your Notion column name exactly: 'Customer_ID'
     """
     if notion_df is None or notion_df.empty:
         return {}
 
-    if "Signed By Name" not in notion_df.columns or "End Date" not in notion_df.columns:
+    if "Customer_ID" not in notion_df.columns or "End Date" not in notion_df.columns:
         return {}
 
-    tmp = notion_df[["Signed By Name", "End Date"]].copy()
-    tmp["End Date"] = tmp["End Date"].apply(parse_notion_date_to_datetime).dt.normalize()
+    tmp = notion_df[["Customer_ID", "End Date"]].copy()
 
-    # If duplicates exist, keep the latest End Date
-    tmp = tmp.dropna(subset=["Signed By Name"])
-    tmp = tmp.sort_values("End Date").drop_duplicates(subset=["Signed By Name"], keep="last")
+    tmp["Customer_ID"] = tmp["Customer_ID"].astype(str).str.strip()
+    tmp["End Date"] = pd.to_datetime(tmp["End Date"], errors="coerce").dt.normalize()
 
-    return tmp.set_index("Signed By Name")["End Date"].to_dict()
+    tmp = tmp[tmp["Customer_ID"].notna() & (tmp["Customer_ID"] != "")]
+
+    # If multiple records exist for the same customer, use the latest end date
+    return tmp.groupby("Customer_ID")["End Date"].max().to_dict()
 
 
 # ----------------------------------------------------------
-# Build Razorpay Name × Date status table (latest token only)
-# + Ended after Notion End Date
-# + Missing Count + Failed Count at end of each row
+# Build Razorpay status table
 # ----------------------------------------------------------
-def build_status_table(df, exclude_names_list, name_to_end_date=None):
+def build_status_table(df, exclude_names_list, customer_to_end_date=None):
     """
-    From a raw payments DataFrame, build the Name × Date status table using only
-    the latest token per user and marking pre-token dates as 'No Token'.
-
+    Build Name × Date table for the latest token per user.
     NEW:
-    - After Notion End Date has passed, mark dates after end date as 'Ended'
-    - Add Missing Count and Failed Count columns at end
+    - After Notion End Date has passed, dates after end date -> 'Ended' (based on customer_id)
+    - Add Missing Count + Failed Count at end of each row
     """
-    name_to_end_date = name_to_end_date or {}
+    customer_to_end_date = customer_to_end_date or {}
 
-    # Only rows with date + token
     df = df.dropna(subset=["date", "token_id"])
 
-    # Remove unwanted names
     if exclude_names_list:
         df = df[~df["name"].isin(exclude_names_list)]
 
@@ -314,20 +295,16 @@ def build_status_table(df, exclude_names_list, name_to_end_date=None):
 
     df["date"] = df["date"].dt.normalize()
 
-    # 1) token_start_date = earliest payment date per token
     token_start = df.groupby("token_id")["date"].min()
     df["token_start_date"] = df["token_id"].map(token_start)
 
-    # 2) latest token per user (by token_start_date)
     token_summary = (
         df[["name", "customer_id", "token_id", "token_start_date"]]
         .drop_duplicates()
         .sort_values(["name", "token_start_date", "token_id"])
     )
 
-    latest_token_per_user = (
-        token_summary.groupby("name").tail(1).reset_index(drop=True)
-    )
+    latest_token_per_user = token_summary.groupby("name").tail(1).reset_index(drop=True)
 
     name_to_latest_token = latest_token_per_user.set_index("name")["token_id"].to_dict()
     df["latest_token_id_for_user"] = df["name"].map(name_to_latest_token)
@@ -336,7 +313,6 @@ def build_status_table(df, exclude_names_list, name_to_end_date=None):
     if df_latest.empty:
         return None
 
-    # 3) date range + pivot
     full_range = pd.date_range(df_latest["date"].min(), df_latest["date"].max(), freq="D")
 
     status_table = df_latest.pivot_table(
@@ -348,7 +324,6 @@ def build_status_table(df, exclude_names_list, name_to_end_date=None):
 
     status_table = status_table.reindex(columns=full_range)
 
-    # 4) Pre-token dates -> No Token
     PRE_TOKEN_LABEL = "No Token"
     name_to_start = latest_token_per_user.set_index("name")["token_start_date"].to_dict()
 
@@ -358,21 +333,27 @@ def build_status_table(df, exclude_names_list, name_to_end_date=None):
             continue
         status_table.loc[name, status_table.columns < start_date] = PRE_TOKEN_LABEL
 
-    # 5) Remaining NaN after token start -> Missing
     status_table = status_table.fillna("Missing")
 
-    # 6) After End Date (if today > end date) -> Ended
+    # ✅ Ended logic based on customer_id + Notion End Date
     ENDED_LABEL = "Ended"
     today = pd.Timestamp(date.today())
 
+    name_to_customer = df_latest.groupby("name")["customer_id"].first().to_dict()
+
     for name in status_table.index:
-        end_date = name_to_end_date.get(name)
+        cust_id = name_to_customer.get(name)
+        if not cust_id:
+            continue
+
+        end_date = customer_to_end_date.get(cust_id)
         if end_date is None or pd.isna(end_date):
             continue
+
         if today > end_date:
             status_table.loc[name, status_table.columns > end_date] = ENDED_LABEL
 
-    # 7) Add row totals
+    # ✅ Counts
     def is_failed_cell(x):
         if not isinstance(x, str):
             return False
@@ -381,7 +362,7 @@ def build_status_table(df, exclude_names_list, name_to_end_date=None):
     status_table["Missing Count"] = (status_table == "Missing").sum(axis=1)
     status_table["Failed Count"] = status_table.applymap(is_failed_cell).sum(axis=1)
 
-    # 8) Pretty date headers (only for the date columns)
+    # Pretty date headers only for date columns
     date_cols = [c for c in status_table.columns if isinstance(c, pd.Timestamp)]
     pretty = {d: d.strftime("%d-%b-%Y") for d in date_cols}
     status_table = status_table.rename(columns=pretty)
@@ -405,12 +386,12 @@ def color_status(val):
 
 
 # ----------------------------------------------------------
-# Tabs layout
+# Tabs
 # ----------------------------------------------------------
 tab1, tab2 = st.tabs(["Razorpay Status Table", "EMI Database"])
 
 # ----------------------------------------------------------
-# Tab 1: Razorpay token status table
+# Tab 1
 # ----------------------------------------------------------
 with tab1:
     with st.spinner("Fetching payments from Razorpay..."):
@@ -419,15 +400,14 @@ with tab1:
     if df_raw.empty:
         st.warning("No payments found from Razorpay with the given credentials.")
     else:
-        # Fetch Notion here ONLY to get End Date mapping for the 'Ended' logic
         with st.spinner("Fetching End Dates from Notion..."):
             notion_df_for_end, _ = fetch_notion_db()
-            name_to_end_date = build_end_date_map(notion_df_for_end)
+            customer_to_end_date = build_customer_end_date_map(notion_df_for_end)
 
         status_table = build_status_table(
             df_raw,
             exclude_names,
-            name_to_end_date=name_to_end_date,
+            customer_to_end_date=customer_to_end_date,
         )
 
         st.subheader("Name × Date – Token Status Table")
@@ -439,7 +419,7 @@ with tab1:
             st.dataframe(styled_table, use_container_width=True)
 
 # ----------------------------------------------------------
-# Tab 2: Notion database browser (PDFs in separate columns)
+# Tab 2
 # ----------------------------------------------------------
 with tab2:
     st.subheader("EMI Database")
@@ -450,18 +430,12 @@ with tab2:
     if notion_df.empty:
         st.warning("No rows found in the Notion database.")
     else:
-        # --------------------------------------------------
-        # Prepare dictionary: page_id → list of PDF files
-        # --------------------------------------------------
         pdf_map = {}
         for f in notion_files:
             if ".pdf" in f["url"].lower():
                 pid = f["page_id"]
                 pdf_map.setdefault(pid, []).append(f)
 
-        # --------------------------------------------------
-        # Create separate PDF columns
-        # --------------------------------------------------
         loan_agreement_links = []
         kfs_links = []
 
@@ -487,15 +461,14 @@ with tab2:
         notion_df["Loan Agreement PDF"] = loan_agreement_links
         notion_df["KFS PDF"] = kfs_links
 
-        # --------------------------------------------------
-        # Reorder columns: key fields at the top
-        # --------------------------------------------------
         preferred_order = [
             "Signed By Name",
+            "Customer_ID",
             "id",
             "Processing Fees (%)",
             "EMI Amount",
             "Disbursement Amount",
+            "End Date",
             "Loan Agreement PDF",
             "KFS PDF",
         ]
@@ -505,9 +478,6 @@ with tab2:
         ]
         notion_df = notion_df[ordered_cols]
 
-        # --------------------------------------------------
-        # Show table with HTML links, scrollable horizontally
-        # --------------------------------------------------
         table_html = notion_df.to_html(escape=False, index=False)
 
         scrollable_html = f"""
