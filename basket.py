@@ -3,6 +3,7 @@ import pandas as pd
 from datetime import datetime, date
 from requests.auth import HTTPBasicAuth
 import streamlit as st
+import calendar
 
 # ----------------------------------------------------------
 # Streamlit page config
@@ -21,9 +22,10 @@ st.markdown(
 - Finds the latest token per customer
 - Builds a **Name × Date** table showing:
   - `"No Token"` before token starts
-  - `"Missing"` where no payment exists after token start
+  - `"Missing"` when a payment was expected but not found
   - Razorpay `status` values on payment dates
   - ✅ `"Ended"` after Notion **End Date** has passed (based on **Customer_ID**)
+  - ✅ For Weekly/Monthly repayment frequencies, Missing/Failed is evaluated **only on charge dates** (not every day)
 
 - ✅ Adds **Missing Count**, **Failed Count**, and **Due Amount (₹)** at end of each row  
   **Due Amount (₹)** = (Missing + Failed) × EMI Amount (from Notion)
@@ -249,14 +251,13 @@ def fetch_notion_db():
     return df, files
 
 
+# ----------------------------------------------------------
+# Notion -> mapping helpers
+# ----------------------------------------------------------
 def build_customer_end_date_map(notion_df):
-    """
-    Customer_ID -> latest End Date (max)
-    Uses your Notion column name exactly: 'Customer_ID'
-    """
+    """Customer_ID -> latest End Date (max)."""
     if notion_df is None or notion_df.empty:
         return {}
-
     if "Customer_ID" not in notion_df.columns or "End Date" not in notion_df.columns:
         return {}
 
@@ -268,47 +269,192 @@ def build_customer_end_date_map(notion_df):
 
 
 def build_customer_emi_amount_map(notion_df):
-    """
-    Customer_ID -> EMI Amount
-    If multiple rows exist for same Customer_ID, pick the latest non-null EMI Amount.
-    """
+    """Customer_ID -> EMI Amount (numeric)."""
     if notion_df is None or notion_df.empty:
         return {}
-
     if "Customer_ID" not in notion_df.columns or "EMI Amount" not in notion_df.columns:
         return {}
 
     tmp = notion_df[["Customer_ID", "EMI Amount"]].copy()
     tmp["Customer_ID"] = tmp["Customer_ID"].astype(str).str.strip()
-
-    # Make EMI numeric
     tmp["EMI Amount"] = pd.to_numeric(tmp["EMI Amount"], errors="coerce")
-
     tmp = tmp[tmp["Customer_ID"].notna() & (tmp["Customer_ID"] != "")]
     tmp = tmp.dropna(subset=["EMI Amount"])
 
     if tmp.empty:
         return {}
 
-    # If multiple entries, keep the last non-null EMI after sorting by index (or just take max)
-    # Here we take max EMI (safer if EMI changed upward; adjust if you prefer "last edited" logic)
     return tmp.groupby("Customer_ID")["EMI Amount"].max().to_dict()
+
+
+def _weekday_str_to_int(s):
+    """
+    Convert various weekday strings to Python weekday int:
+    Monday=0 ... Sunday=6
+    Accepts: 'Saturday', 'Sat', 'saturday', etc.
+    """
+    if s is None or (isinstance(s, float) and pd.isna(s)):
+        return None
+
+    s = str(s).strip().lower()
+    if not s:
+        return None
+
+    mapping = {
+        "mon": 0, "monday": 0,
+        "tue": 1, "tues": 1, "tuesday": 1,
+        "wed": 2, "wednesday": 2,
+        "thu": 3, "thur": 3, "thurs": 3, "thursday": 3,
+        "fri": 4, "friday": 4,
+        "sat": 5, "saturday": 5,
+        "sun": 6, "sunday": 6,
+    }
+    return mapping.get(s)
+
+
+def build_customer_schedule_map(notion_df):
+    """
+    Customer_ID -> schedule dict:
+      {
+        "frequency": "daily"|"weekly"|"monthly",
+        "charge_weekday": 0..6 or None,
+        "charge_dom": 1..31 or None
+      }
+
+    Uses Notion columns:
+      - Customer_ID
+      - Repayment Frequency
+      - Day_of_Week_to_Charge
+      - (optional) Day_of_Month_to_Charge
+    """
+    if notion_df is None or notion_df.empty:
+        return {}
+
+    if "Customer_ID" not in notion_df.columns:
+        return {}
+
+    freq_col = "Repayment Frequency"
+    dow_col = "Day_of_Week_to_Charge"
+    dom_col = "Day_of_Month_to_Charge"  # optional
+
+    tmp_cols = ["Customer_ID"]
+    if freq_col in notion_df.columns:
+        tmp_cols.append(freq_col)
+    if dow_col in notion_df.columns:
+        tmp_cols.append(dow_col)
+    if dom_col in notion_df.columns:
+        tmp_cols.append(dom_col)
+
+    tmp = notion_df[tmp_cols].copy()
+    tmp["Customer_ID"] = tmp["Customer_ID"].astype(str).str.strip()
+    tmp = tmp[tmp["Customer_ID"].notna() & (tmp["Customer_ID"] != "")]
+
+    # If multiple rows per Customer_ID, take the last non-null-ish values by grouping (practical approach)
+    def pick_last_non_null(series):
+        s = series.dropna()
+        if s.empty:
+            return None
+        return s.iloc[-1]
+
+    grouped = tmp.groupby("Customer_ID", as_index=False).agg({
+        freq_col: pick_last_non_null if freq_col in tmp.columns else pick_last_non_null,
+        dow_col: pick_last_non_null if dow_col in tmp.columns else pick_last_non_null,
+        dom_col: pick_last_non_null if dom_col in tmp.columns else pick_last_non_null,
+    })
+
+    schedule_map = {}
+    for _, r in grouped.iterrows():
+        cid = r["Customer_ID"]
+
+        freq_raw = r.get(freq_col, None)
+        freq = str(freq_raw).strip().lower() if freq_raw is not None and not (isinstance(freq_raw, float) and pd.isna(freq_raw)) else "daily"
+        if "week" in freq:
+            freq = "weekly"
+        elif "month" in freq:
+            freq = "monthly"
+        else:
+            freq = "daily"
+
+        charge_weekday = _weekday_str_to_int(r.get(dow_col, None)) if dow_col in grouped.columns else None
+
+        charge_dom = None
+        if dom_col in grouped.columns:
+            dom_val = r.get(dom_col, None)
+            try:
+                charge_dom = int(dom_val) if dom_val is not None and not (isinstance(dom_val, float) and pd.isna(dom_val)) else None
+            except Exception:
+                charge_dom = None
+
+        schedule_map[cid] = {
+            "frequency": freq,
+            "charge_weekday": charge_weekday,
+            "charge_dom": charge_dom,
+        }
+
+    return schedule_map
+
+
+# ----------------------------------------------------------
+# Expected-charge-date logic
+# ----------------------------------------------------------
+def is_charge_date(ts: pd.Timestamp, schedule: dict) -> bool:
+    """
+    Decide if a given date is an expected EMI charge date for a customer.
+    - daily: every day
+    - weekly: only weekday matches charge_weekday (0=Mon ... 6=Sun)
+    - monthly: only day-of-month matches charge_dom (if provided)
+      If charge_dom is > last day of month, we treat last day as charge day.
+    """
+    if schedule is None:
+        return True  # default daily behavior
+
+    freq = (schedule.get("frequency") or "daily").lower()
+
+    if freq == "daily":
+        return True
+
+    if freq == "weekly":
+        wd = schedule.get("charge_weekday")
+        if wd is None:
+            return True  # fallback to daily if not configured
+        return ts.weekday() == wd
+
+    if freq == "monthly":
+        dom = schedule.get("charge_dom")
+        if dom is None:
+            return True  # fallback to daily if not configured
+
+        last_dom = calendar.monthrange(ts.year, ts.month)[1]
+        effective_dom = min(int(dom), last_dom)
+        return ts.day == effective_dom
+
+    return True
 
 
 # ----------------------------------------------------------
 # Build Razorpay status table
 # ----------------------------------------------------------
-def build_status_table(df, exclude_names_list, customer_to_end_date=None, customer_to_emi=None):
+def build_status_table(
+    df,
+    exclude_names_list,
+    customer_to_end_date=None,
+    customer_to_emi=None,
+    customer_to_schedule=None,
+):
     """
     Build Name × Date table for the latest token per user.
 
-    NEW:
-    - After Notion End Date has passed, dates after end date -> 'Ended' (based on customer_id)
-    - Add Missing Count + Failed Count + Due Amount (₹)
-      Due Amount = (Missing + Failed) * EMI Amount
+    Key behaviors:
+    - Pre-token dates => 'No Token'
+    - Only EXPECTED charge dates can be Missing (based on repayment schedule)
+    - Non-charge dates are blank (""), not Missing/Failed
+    - After End Date has passed, future dates > end date => 'Ended'
+    - Missing/Failed counts computed only on expected charge dates
+    - Due Amount = (Missing + Failed) * EMI Amount
     """
     customer_to_end_date = customer_to_end_date or {}
     customer_to_emi = customer_to_emi or {}
+    customer_to_schedule = customer_to_schedule or {}
 
     df = df.dropna(subset=["date", "token_id"])
 
@@ -320,17 +466,19 @@ def build_status_table(df, exclude_names_list, customer_to_end_date=None, custom
 
     df["date"] = df["date"].dt.normalize()
 
+    # token_start_date = earliest payment date per token
     token_start = df.groupby("token_id")["date"].min()
     df["token_start_date"] = df["token_id"].map(token_start)
 
+    # latest token per user (by token_start_date)
     token_summary = (
         df[["name", "customer_id", "token_id", "token_start_date"]]
         .drop_duplicates()
         .sort_values(["name", "token_start_date", "token_id"])
     )
-
     latest_token_per_user = token_summary.groupby("name").tail(1).reset_index(drop=True)
 
+    # map name -> latest token
     name_to_latest_token = latest_token_per_user.set_index("name")["token_id"].to_dict()
     df["latest_token_id_for_user"] = df["name"].map(name_to_latest_token)
 
@@ -338,34 +486,55 @@ def build_status_table(df, exclude_names_list, customer_to_end_date=None, custom
     if df_latest.empty:
         return None
 
+    # Date range (still daily columns; we just won't mark missing on non-charge days)
     full_range = pd.date_range(df_latest["date"].min(), df_latest["date"].max(), freq="D")
 
+    # Pivot actual payment statuses
     status_table = df_latest.pivot_table(
         index="name",
         columns="date",
         values="status",
         aggfunc=lambda x: ", ".join(sorted(set(x))),
     )
-
     status_table = status_table.reindex(columns=full_range)
 
+    # Pre-token => No Token
     PRE_TOKEN_LABEL = "No Token"
     name_to_start = latest_token_per_user.set_index("name")["token_start_date"].to_dict()
-
     for name in status_table.index:
         start_date = name_to_start.get(name)
         if start_date is None:
             continue
         status_table.loc[name, status_table.columns < start_date] = PRE_TOKEN_LABEL
 
+    # Fill NaN temporarily; we will replace non-charge days with blank afterwards
     status_table = status_table.fillna("Missing")
 
-    # ✅ Ended logic based on customer_id + Notion End Date
+    # name -> customer_id for latest-token dataset
+    name_to_customer = df_latest.groupby("name")["customer_id"].first().to_dict()
+
+    # Apply schedule: non-charge days should be blank ("") instead of Missing
+    BLANK_LABEL = ""
+    for name in status_table.index:
+        cust_id = name_to_customer.get(name)
+        sched = customer_to_schedule.get(cust_id, {"frequency": "daily"}) if cust_id else {"frequency": "daily"}
+
+        start_date = name_to_start.get(name)
+        if start_date is None:
+            continue
+
+        # Only consider dates >= token_start for schedule masking
+        for col_date in [c for c in status_table.columns if isinstance(c, pd.Timestamp)]:
+            if col_date < start_date:
+                continue  # already No Token
+            if not is_charge_date(col_date, sched):
+                # if there is an actual payment on a non-charge date, keep it; otherwise blank it
+                if status_table.loc[name, col_date] == "Missing":
+                    status_table.loc[name, col_date] = BLANK_LABEL
+
+    # Ended logic: after End Date has passed, dates after end date => Ended
     ENDED_LABEL = "Ended"
     today = pd.Timestamp(date.today())
-
-    # (name -> customer_id) for the latest-token dataset
-    name_to_customer = df_latest.groupby("name")["customer_id"].first().to_dict()
 
     for name in status_table.index:
         cust_id = name_to_customer.get(name)
@@ -377,9 +546,12 @@ def build_status_table(df, exclude_names_list, customer_to_end_date=None, custom
             continue
 
         if today > end_date:
-            status_table.loc[name, status_table.columns > end_date] = ENDED_LABEL
+            # only mark future dates > end_date as Ended (including blanks/missing)
+            for col_date in [c for c in status_table.columns if isinstance(c, pd.Timestamp)]:
+                if col_date > end_date:
+                    status_table.loc[name, col_date] = ENDED_LABEL
 
-    # ✅ Counts
+    # Counts (only count literal Missing, and any cell containing "failed")
     def is_failed_cell(x):
         if not isinstance(x, str):
             return False
@@ -388,10 +560,8 @@ def build_status_table(df, exclude_names_list, customer_to_end_date=None, custom
     status_table["Missing Count"] = (status_table == "Missing").sum(axis=1)
     status_table["Failed Count"] = status_table.applymap(is_failed_cell).sum(axis=1)
 
-    # ✅ EMI + Due Amount
-    emi_vals = []
-    due_vals = []
-
+    # EMI + Due Amount
+    emi_vals, due_vals = [], []
     for name in status_table.index:
         cust_id = name_to_customer.get(name)
         emi = customer_to_emi.get(cust_id) if cust_id else None
@@ -447,16 +617,18 @@ with tab1:
     if df_raw.empty:
         st.warning("No payments found from Razorpay with the given credentials.")
     else:
-        with st.spinner("Fetching End Dates + EMI Amounts from Notion..."):
+        with st.spinner("Fetching End Dates + EMI Amounts + Schedules from Notion..."):
             notion_df_for_maps, _ = fetch_notion_db()
             customer_to_end_date = build_customer_end_date_map(notion_df_for_maps)
             customer_to_emi = build_customer_emi_amount_map(notion_df_for_maps)
+            customer_to_schedule = build_customer_schedule_map(notion_df_for_maps)
 
         status_table = build_status_table(
             df_raw,
             exclude_names,
             customer_to_end_date=customer_to_end_date,
             customer_to_emi=customer_to_emi,
+            customer_to_schedule=customer_to_schedule,
         )
 
         st.subheader("Name × Date – Token Status Table")
@@ -485,8 +657,7 @@ with tab2:
                 pid = f["page_id"]
                 pdf_map.setdefault(pid, []).append(f)
 
-        loan_agreement_links = []
-        kfs_links = []
+        loan_agreement_links, kfs_links = [], []
 
         for _, row in notion_df.iterrows():
             page_id = row["page_id"]
@@ -513,6 +684,9 @@ with tab2:
         preferred_order = [
             "Signed By Name",
             "Customer_ID",
+            "Repayment Frequency",
+            "Day_of_Week_to_Charge",
+            "Day_of_Month_to_Charge",
             "id",
             "EMI Amount",
             "Disbursement Amount",
