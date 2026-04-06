@@ -496,7 +496,7 @@ def build_status_table(
         values="status",
         aggfunc=lambda x: ", ".join(sorted(set(x))),
     )
-    status_table = status_table.reindex(columns=full_range)
+    status_table = status_table.reindex(columns=full_range).astype(object)
 
     # Pre-token => No Token
     PRE_TOKEN_LABEL = "No Token"
