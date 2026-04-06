@@ -558,7 +558,7 @@ def build_status_table(
         return "failed" in x.lower()
 
     status_table["Missing Count"] = (status_table == "Missing").sum(axis=1)
-    status_table["Failed Count"] = status_table.applymap(is_failed_cell).sum(axis=1)
+    status_table["Failed Count"] = status_table.map(is_failed_cell).sum(axis=1)
 
     # EMI + Due Amount
     emi_vals, due_vals = [], []
@@ -636,7 +636,7 @@ with tab1:
         if status_table is None or status_table.empty:
             st.warning("No data available after filtering and token processing.")
         else:
-            styled_table = status_table.style.applymap(color_status)
+            styled_table = status_table.style.map(color_status)
             st.dataframe(styled_table, use_container_width=True)
 
 # ----------------------------------------------------------
